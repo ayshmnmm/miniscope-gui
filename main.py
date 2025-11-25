@@ -26,39 +26,55 @@ import numpy as np
 FAKE_FS = 6000  # Hz, fake sampling rate for the demo
 ADC_MAX = 4095
 VREF = 3.3
+NUM_CHANNELS = 2
 
-# UART frame: 256 samples * 2 bytes = 512 bytes
-SAMPLES_PER_FRAME = 256
-FRAME_BYTES = SAMPLES_PER_FRAME * 2
+# UART frame: 128 samples per channel, interleaved, 2 bytes each = 512 bytes
+SAMPLES_PER_CHANNEL = 128
+SAMPLES_PER_FRAME = SAMPLES_PER_CHANNEL * NUM_CHANNELS  # 256 total samples
+FRAME_BYTES = SAMPLES_PER_FRAME * 2  # 512 bytes
+BUFFER_SIZE = 8000  # larger buffer for each channel
 
 # ------------------------------------------------------------
-# Fake ADC source (~6 kS/s)
+# Fake ADC source (~6 kS/s) - Dual Channel
 # ------------------------------------------------------------
 class FakeSource:
-    def __init__(self, buf_size=4000, vref=VREF, fs=FAKE_FS):
+    def __init__(self, buf_size=BUFFER_SIZE, vref=VREF, fs=FAKE_FS):
         self.dt = 1 / fs
         self.fs = fs
         self.t = 0.0
-        self.buf = deque([0] * buf_size, maxlen=buf_size)
+        self.buf_ch1 = deque([0] * buf_size, maxlen=buf_size)
+        self.buf_ch2 = deque([0] * buf_size, maxlen=buf_size)
         self.noise = 15
         self.vref = vref
         self.adc_max = ADC_MAX
-        self.freq = 80  # Hz sine
+        self.freq1 = 80   # Hz sine for channel 1
+        self.freq2 = 120  # Hz sine for channel 2
 
     def generate(self):
-        """Generate new samples and update circular buffer."""
+        """Generate new samples and update circular buffers for both channels."""
         for _ in range(60):
-            v = 2048 + 700 * math.sin(2 * math.pi * self.freq * self.t)
-            v += random.randint(-self.noise, self.noise)
-            v = max(0, min(self.adc_max, int(v)))
-            self.buf.append(v)
+            # Channel 1: 80 Hz sine
+            v1 = 2048 + 700 * math.sin(2 * math.pi * self.freq1 * self.t)
+            v1 += random.randint(-self.noise, self.noise)
+            v1 = max(0, min(self.adc_max, int(v1)))
+            self.buf_ch1.append(v1)
+            
+            # Channel 2: 120 Hz sine with different amplitude
+            v2 = 2048 + 500 * math.sin(2 * math.pi * self.freq2 * self.t)
+            v2 += random.randint(-self.noise, self.noise)
+            v2 = max(0, min(self.adc_max, int(v2)))
+            self.buf_ch2.append(v2)
+            
             self.t += self.dt
-        return list(self.buf)
+        return {'ch1': list(self.buf_ch1), 'ch2': list(self.buf_ch2)}
 
-    def to_voltage(self, arr):
-        """ADC counts → volts."""
+    def to_voltage(self, data_dict):
+        """ADC counts → volts for both channels."""
         scale = self.vref / self.adc_max
-        return [x * scale for x in arr]
+        return {
+            'ch1': [x * scale for x in data_dict['ch1']],
+            'ch2': [x * scale for x in data_dict['ch2']]
+        }
 
 # ------------------------------------------------------------
 # Serial reader thread (background)
@@ -127,24 +143,36 @@ class SerialReader(threading.Thread):
                     del self._buf[:self.frame_bytes]
 
                     # Convert to samples (little-endian 16-bit, lower 12 bits valid)
-                    samples = []
-                    for i in range(0, len(frame_bytes), 2):
-                        lo = frame_bytes[i]
-                        hi = frame_bytes[i + 1]
-                        raw = (hi << 8) | lo
-                        adc12 = raw & 0x0FFF
-                        samples.append(adc12)
+                    # Data is interleaved: {C1S1, C2S1, C1S2, C2S2, ...}
+                    samples_ch1 = []
+                    samples_ch2 = []
+                    for i in range(0, len(frame_bytes), 4):  # step by 4 bytes (2 samples)
+                        # Channel 1 sample
+                        lo1 = frame_bytes[i]
+                        hi1 = frame_bytes[i + 1]
+                        raw1 = (hi1 << 8) | lo1
+                        adc12_ch1 = raw1 & 0x0FFF
+                        samples_ch1.append(adc12_ch1)
+                        
+                        # Channel 2 sample
+                        lo2 = frame_bytes[i + 2]
+                        hi2 = frame_bytes[i + 3]
+                        raw2 = (hi2 << 8) | lo2
+                        adc12_ch2 = raw2 & 0x0FFF
+                        samples_ch2.append(adc12_ch2)
+                    
+                    frame_data = {'ch1': samples_ch1, 'ch2': samples_ch2}
 
                     # push latest frame: if queue full, drop oldest to not block GUI
                     try:
-                        self.q.put_nowait(samples)
+                        self.q.put_nowait(frame_data)
                     except queue.Full:
                         try:
                             _ = self.q.get_nowait()  # drop one
                         except Exception:
                             pass
                         try:
-                            self.q.put_nowait(samples)
+                            self.q.put_nowait(frame_data)
                         except Exception:
                             pass
 
@@ -190,12 +218,28 @@ class MainWindow(QMainWindow):
         self.src_fake = FakeSource()
         self.is_frozen = False
         self.fft_mode = False
+        
+        # Dual-channel buffers
+        self.buffer_ch1 = deque([0] * BUFFER_SIZE, maxlen=BUFFER_SIZE)
+        self.buffer_ch2 = deque([0] * BUFFER_SIZE, maxlen=BUFFER_SIZE)
+        
+        # Trigger state - Independent per channel
         self.trigger_mode = "AUTO"     # AUTO / NORMAL
         self.trigger_rising = True
-        self.threshold = 2048          # ADC counts
-        self.cycles_to_show = 3
+        self.threshold_ch1 = 2048      # ADC counts
+        self.threshold_ch2 = 2048      # ADC counts
+        
+        # Scaling
+        self.volts_per_div = 1.0       # V/div
+        self.time_per_div = 0.001      # s/div (1ms)
+        self.ch1_offset = 0.0          # vertical offset in volts
+        self.ch2_offset = 0.0
+        
+        # Channel enables
+        self.ch1_enabled = True
+        self.ch2_enabled = True
 
-        self.last_data_volts = []      # last time-domain volts window (for cursors & saving)
+        self.last_data_volts = {}      # dict with 'ch1' and 'ch2' keys
 
         # Cursor state
         self.cursors_enabled = False
@@ -214,7 +258,16 @@ class MainWindow(QMainWindow):
         # ---- Plot ----
         self.plot = pg.PlotWidget(background=None)
         self.plot.showGrid(x=True, y=True)
-        self.curve = self.plot.plot(pen=pg.mkPen('g', width=2))
+        self.plot.addLegend()
+        self.curve_ch1 = self.plot.plot(pen=pg.mkPen('g', width=2), name='Channel 1')
+        self.curve_ch2 = self.plot.plot(pen=pg.mkPen('y', width=2), name='Channel 2')
+        
+        # Trigger level indicators (arrows on plot)
+        self.trigger_line_ch1 = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('g', width=1, style=Qt.PenStyle.DashLine))
+        self.trigger_line_ch2 = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('y', width=1, style=Qt.PenStyle.DashLine))
+        self.plot.addItem(self.trigger_line_ch1)
+        self.plot.addItem(self.trigger_line_ch2)
+        
         hbox.addWidget(self.plot, stretch=3)
 
         # ---- Cursors (hidden initially) ----
@@ -252,13 +305,27 @@ class MainWindow(QMainWindow):
         self.trig_select.currentIndexChanged.connect(self.update_trigger_mode)
         controls.addWidget(self.trig_select)
 
-        # Trigger Level (ADC counts)
-        controls.addWidget(QLabel("Trigger Level"))
-        self.th_slider = QSlider(Qt.Orientation.Horizontal)
-        self.th_slider.setRange(0, ADC_MAX)
-        self.th_slider.setValue(self.threshold)
-        self.th_slider.valueChanged.connect(self.update_threshold)
-        controls.addWidget(self.th_slider)
+        # Trigger Level CH1
+        controls.addWidget(QLabel("Trigger Level CH1"))
+        self.th_slider_ch1 = QSlider(Qt.Orientation.Horizontal)
+        self.th_slider_ch1.setRange(0, ADC_MAX)
+        self.th_slider_ch1.setValue(self.threshold_ch1)
+        self.th_slider_ch1.valueChanged.connect(self.update_threshold_ch1)
+        controls.addWidget(self.th_slider_ch1)
+        self.th_label_ch1 = QLabel(f"{self.threshold_ch1 * VREF / ADC_MAX:.3f} V")
+        self.th_label_ch1.setStyleSheet("color: green;")
+        controls.addWidget(self.th_label_ch1)
+        
+        # Trigger Level CH2
+        controls.addWidget(QLabel("Trigger Level CH2"))
+        self.th_slider_ch2 = QSlider(Qt.Orientation.Horizontal)
+        self.th_slider_ch2.setRange(0, ADC_MAX)
+        self.th_slider_ch2.setValue(self.threshold_ch2)
+        self.th_slider_ch2.valueChanged.connect(self.update_threshold_ch2)
+        controls.addWidget(self.th_slider_ch2)
+        self.th_label_ch2 = QLabel(f"{self.threshold_ch2 * VREF / ADC_MAX:.3f} V")
+        self.th_label_ch2.setStyleSheet("color: yellow;")
+        controls.addWidget(self.th_label_ch2)
 
         # COM Port
         controls.addWidget(QLabel("COM Port"))
@@ -279,14 +346,29 @@ class MainWindow(QMainWindow):
         self.use_uart_btn.clicked.connect(self.toggle_uart)
         controls.addWidget(self.use_uart_btn)
 
-        # Cycles
-        controls.addWidget(QLabel("Cycles"))
-        self.cycles_select = QComboBox()
-        for i in range(1, 11):
-            self.cycles_select.addItem(str(i))
-        self.cycles_select.setCurrentText(str(self.cycles_to_show))
-        self.cycles_select.currentIndexChanged.connect(self.update_cycles)
-        controls.addWidget(self.cycles_select)
+        # Time Scale Control (slider in ms)
+        controls.addWidget(QLabel("Time Scale (ms/div)"))
+        self.time_slider = QSlider(Qt.Orientation.Horizontal)
+        self.time_slider.setRange(1, 100)  # 0.1ms to 10ms (in 0.1ms units)
+        self.time_slider.setValue(10)  # default 1ms
+        self.time_slider.valueChanged.connect(self.update_time_scale)
+        controls.addWidget(self.time_slider)
+        self.time_label = QLabel("1.0 ms/div")
+        self.time_label.setStyleSheet("color: white;")
+        controls.addWidget(self.time_label)
+        
+        # Channel Enable
+        self.ch1_enable_btn = QPushButton("CH1 Enabled")
+        self.ch1_enable_btn.setCheckable(True)
+        self.ch1_enable_btn.setChecked(True)
+        self.ch1_enable_btn.clicked.connect(self.toggle_ch1)
+        controls.addWidget(self.ch1_enable_btn)
+        
+        self.ch2_enable_btn = QPushButton("CH2 Enabled")
+        self.ch2_enable_btn.setCheckable(True)
+        self.ch2_enable_btn.setChecked(True)
+        self.ch2_enable_btn.clicked.connect(self.toggle_ch2)
+        controls.addWidget(self.ch2_enable_btn)
 
         # Save
         self.save_btn = QPushButton("Save CSV")
@@ -332,11 +414,35 @@ class MainWindow(QMainWindow):
     def update_trigger_mode(self):
         self.trigger_mode = self.trig_select.currentText()
 
-    def update_threshold(self):
-        self.threshold = self.th_slider.value()
+    def update_threshold_ch1(self):
+        self.threshold_ch1 = self.th_slider_ch1.value()
+        # Update voltage label
+        voltage = self.threshold_ch1 * VREF / ADC_MAX
+        self.th_label_ch1.setText(f"{voltage:.3f} V")
+        # Update trigger line on plot
+        self.trigger_line_ch1.setValue(voltage)
 
-    def update_cycles(self):
-        self.cycles_to_show = int(self.cycles_select.currentText())
+    def update_threshold_ch2(self):
+        self.threshold_ch2 = self.th_slider_ch2.value()
+        # Update voltage label
+        voltage = self.threshold_ch2 * VREF / ADC_MAX
+        self.th_label_ch2.setText(f"{voltage:.3f} V")
+        # Update trigger line on plot
+        self.trigger_line_ch2.setValue(voltage)
+    
+    def update_time_scale(self):
+        # Slider value 1-100 represents 0.1ms to 10ms
+        self.time_per_div = self.time_slider.value() / 1000.0  # convert to seconds
+        self.time_label.setText(f"{self.time_slider.value() / 10.0:.1f} ms/div")
+    
+    def toggle_ch1(self):
+        self.ch1_enabled = self.ch1_enable_btn.isChecked()
+        self.curve_ch1.setVisible(self.ch1_enabled)
+    
+    def toggle_ch2(self):
+        self.ch2_enabled = self.ch2_enable_btn.isChecked()
+        self.curve_ch2.setVisible(self.ch2_enabled)
+
 
     def update_com_ports(self):
         ports = serial.tools.list_ports.comports()
@@ -405,7 +511,7 @@ class MainWindow(QMainWindow):
     # Save
     # --------------------------------------------------------
     def save_csv(self):
-        if not self.last_data_volts:
+        if not self.last_data_volts or 'ch1' not in self.last_data_volts:
             return
         fname, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV files (*.csv)")
         if not fname:
@@ -413,9 +519,14 @@ class MainWindow(QMainWindow):
         try:
             with open(fname, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["index", "voltage"])
-                for i, v in enumerate(self.last_data_volts):
-                    w.writerow([i, v])
+                w.writerow(["index", "channel1_voltage", "channel2_voltage"])
+                ch1 = self.last_data_volts.get('ch1', [])
+                ch2 = self.last_data_volts.get('ch2', [])
+                max_len = max(len(ch1), len(ch2))
+                for i in range(max_len):
+                    v1 = ch1[i] if i < len(ch1) else 0.0
+                    v2 = ch2[i] if i < len(ch2) else 0.0
+                    w.writerow([i, v1, v2])
         except Exception:
             traceback.print_exc()
 
@@ -426,8 +537,11 @@ class MainWindow(QMainWindow):
         """Update cursor readout text for vertical/horizontal modes."""
         if not self.cursors_enabled or not self.last_data_volts or self.fft_mode:
             return
+        if 'ch1' not in self.last_data_volts:
+            return
 
-        N = len(self.last_data_volts)
+        ch1_data = self.last_data_volts['ch1']
+        N = len(ch1_data)
         Fs = FAKE_FS
 
         if self.cursor_vertical:
@@ -437,14 +551,14 @@ class MainWindow(QMainWindow):
             # interpret x as sample index if reasonable, else clamp
             i1 = int(max(0, min(N - 1, x1)))
             i2 = int(max(0, min(N - 1, x2)))
-            v1 = self.last_data_volts[i1]
-            v2 = self.last_data_volts[i2]
-            dv = v2 - v1
+            v1_ch1 = ch1_data[i1]
+            v2_ch1 = ch1_data[i2]
+            dv_ch1 = v2_ch1 - v1_ch1
             dt = abs(x2 - x1) / Fs
             self.cursor_label.setText(
-                f"P1: {i1} → {v1:.3f} V\n"
-                f"P2: {i2} → {v2:.3f} V\n"
-                f"ΔV = {dv:.3f} V\n"
+                f"P1: {i1} → CH1:{v1_ch1:.3f} V\n"
+                f"P2: {i2} → CH1:{v2_ch1:.3f} V\n"
+                f"ΔV(CH1) = {dv_ch1:.3f} V\n"
                 f"Δt = {dt:.6f} s"
             )
         else:
@@ -465,8 +579,8 @@ class MainWindow(QMainWindow):
         if self.is_frozen:
             return
 
-        # Get raw counts either from UART queue or from fake generator
-        raw = None
+        # Get raw counts (dict with 'ch1' and 'ch2') from UART queue or fake generator
+        raw_dict = None
         if self.use_uart:
             # consume all frames and use the latest to avoid backlog/jitter
             latest = None
@@ -477,56 +591,115 @@ class MainWindow(QMainWindow):
                 pass
             if latest is None:
                 return  # no new frame yet
-            raw = latest
+            raw_dict = latest
         else:
-            raw = self.src_fake.generate()  # list of ADC counts
+            raw_dict = self.src_fake.generate()  # dict of ADC counts
 
-        # If raw is shorter than needed, bail
-        if not raw:
+        # If raw is missing or invalid, bail
+        if not raw_dict or 'ch1' not in raw_dict or 'ch2' not in raw_dict:
             return
 
-        triggers = find_triggers(raw, self.threshold, self.trigger_rising, max_found=3)
+        # Update larger buffers with new data
+        for val in raw_dict['ch1']:
+            self.buffer_ch1.append(val)
+        for val in raw_dict['ch2']:
+            self.buffer_ch2.append(val)
 
-        # Build time-domain window (counts) according to trigger mode
+        # Work with buffer data (lists of ADC counts)
+        raw_ch1 = list(self.buffer_ch1)
+        raw_ch2 = list(self.buffer_ch2)
+
+        # Calculate samples to display based on time/div
+        # Assume 10 divisions horizontal (typical oscilloscope)
+        samples_to_show = int(self.time_per_div * FAKE_FS * 10)
+        samples_to_show = max(100, min(samples_to_show, len(raw_ch1)))  # clamp
+
+        # Independent triggering for each channel
+        # Trigger on CH1 first
+        triggers_ch1 = find_triggers(raw_ch1, self.threshold_ch1, self.trigger_rising, max_found=1)
+        
+        # Build CH1 data window according to trigger mode
         if self.trigger_mode == "AUTO":
-            if len(triggers) < 2:
-                data_counts = raw[-2000:] if len(raw) >= 2000 else raw[:]
-            else:
-                p0, p1 = triggers[:2]
-                period = max(1, p1 - p0)
-                needed = period * self.cycles_to_show
-                # clamp to available length
-                if p0 + needed <= len(raw):
-                    data_counts = raw[p0:p0 + needed]
+            if len(triggers_ch1) >= 1:
+                p0_ch1 = triggers_ch1[0]
+                if p0_ch1 + samples_to_show <= len(raw_ch1):
+                    data_ch1 = raw_ch1[p0_ch1:p0_ch1 + samples_to_show]
                 else:
-                    # fall back to last N
-                    data_counts = raw[-needed:] if len(raw) >= needed else raw[:]
-        else:  # NORMAL
-            if len(triggers) < 2:
-                return  # wait until valid trigger
-            p0, p1 = triggers[:2]
-            period = max(1, p1 - p0)
-            needed = period * self.cycles_to_show
-            if p0 + needed <= len(raw):
-                data_counts = raw[p0:p0 + needed]
+                    data_ch1 = raw_ch1[-samples_to_show:]
             else:
-                data_counts = raw[-needed:] if len(raw) >= needed else raw[:]
+                # No trigger found, show last N samples
+                data_ch1 = raw_ch1[-samples_to_show:]
+        else:  # NORMAL
+            if len(triggers_ch1) >= 1:
+                p0_ch1 = triggers_ch1[0]
+                if p0_ch1 + samples_to_show <= len(raw_ch1):
+                    data_ch1 = raw_ch1[p0_ch1:p0_ch1 + samples_to_show]
+                else:
+                    # Not enough data, use what we have
+                    data_ch1 = raw_ch1[-samples_to_show:]
+            else:
+                # In NORMAL mode, if no trigger, don't update
+                data_ch1 = []
+
+        # Now trigger on CH2 independently
+        triggers_ch2 = find_triggers(raw_ch2, self.threshold_ch2, self.trigger_rising, max_found=1)
+        
+        # Build CH2 data window according to trigger mode
+        if self.trigger_mode == "AUTO":
+            if len(triggers_ch2) >= 1:
+                p0_ch2 = triggers_ch2[0]
+                if p0_ch2 + samples_to_show <= len(raw_ch2):
+                    data_ch2 = raw_ch2[p0_ch2:p0_ch2 + samples_to_show]
+                else:
+                    data_ch2 = raw_ch2[-samples_to_show:]
+            else:
+                # No trigger found, show last N samples
+                data_ch2 = raw_ch2[-samples_to_show:]
+        else:  # NORMAL
+            if len(triggers_ch2) >= 1:
+                p0_ch2 = triggers_ch2[0]
+                if p0_ch2 + samples_to_show <= len(raw_ch2):
+                    data_ch2 = raw_ch2[p0_ch2:p0_ch2 + samples_to_show]
+                else:
+                    # Not enough data, use what we have
+                    data_ch2 = raw_ch2[-samples_to_show:]
+            else:
+                # In NORMAL mode, if no trigger, don't update
+                data_ch2 = []
+
+        # If in NORMAL mode and either channel has no trigger, bail
+        if self.trigger_mode == "NORMAL" and (not data_ch1 or not data_ch2):
+            return
 
         # Convert to volts
         if self.use_uart:
             scale = VREF / ADC_MAX
-            volts = [x * scale for x in data_counts]
+            volts_ch1 = [x * scale for x in data_ch1]
+            volts_ch2 = [x * scale for x in data_ch2]
         else:
-            volts = self.src_fake.to_voltage(data_counts)
+            temp_dict = {'ch1': data_ch1, 'ch2': data_ch2}
+            volts_dict = self.src_fake.to_voltage(temp_dict)
+            volts_ch1 = volts_dict['ch1']
+            volts_ch2 = volts_dict['ch2']
 
-        self.last_data_volts = volts
+        # Apply offsets
+        volts_ch1 = [v + self.ch1_offset for v in volts_ch1]
+        volts_ch2 = [v + self.ch2_offset for v in volts_ch2]
+
+        self.last_data_volts = {'ch1': volts_ch1, 'ch2': volts_ch2}
 
         if not self.fft_mode:
             # TIME DOMAIN
             self.plot.setLabel("bottom", "Samples")
             self.plot.setLabel("left", "Volts")
             self.plot.enableAutoRange()
-            self.curve.setData(volts)
+            
+            # Update both channel curves
+            if self.ch1_enabled:
+                self.curve_ch1.setData(volts_ch1)
+            if self.ch2_enabled:
+                self.curve_ch2.setData(volts_ch2)
+            
             # Keep cursor visibility up to date and refresh readout
             self.apply_cursor_visibility()
             self.update_cursors()
@@ -534,18 +707,26 @@ class MainWindow(QMainWindow):
 
         # FFT MODE (magnitude spectrum)
         Fs = FAKE_FS
-        n = len(volts)
+        n = len(volts_ch1)
         if n < 16:
             return
 
-        yf = np.fft.rfft(volts)
+        # FFT for both channels
+        yf_ch1 = np.fft.rfft(volts_ch1)
+        yf_ch2 = np.fft.rfft(volts_ch2)
         xf = np.fft.rfftfreq(n, 1 / Fs)
-        mag = np.abs(yf)
+        mag_ch1 = np.abs(yf_ch1)
+        mag_ch2 = np.abs(yf_ch2)
 
         self.plot.setLabel("bottom", "Frequency (Hz)")
         self.plot.setLabel("left", "Magnitude")
         self.plot.enableAutoRange()
-        self.curve.setData(xf, mag)
+        
+        if self.ch1_enabled:
+            self.curve_ch1.setData(xf, mag_ch1)
+        if self.ch2_enabled:
+            self.curve_ch2.setData(xf, mag_ch2)
+        
         # Hide cursors in FFT mode
         self.apply_cursor_visibility()
 
