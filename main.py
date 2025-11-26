@@ -56,12 +56,18 @@ class FakeSource:
             # Channel 1: 80 Hz sine
             v1 = 2048 + 700 * math.sin(2 * math.pi * self.freq1 * self.t)
             v1 += random.randint(-self.noise, self.noise)
+            # Add random spikes (simulating noise glitches)
+            if random.random() < 0.01:  # 1% chance
+                v1 += random.choice([-1000, 1000])
             v1 = max(0, min(self.adc_max, int(v1)))
             self.buf_ch1.append(v1)
             
             # Channel 2: 120 Hz sine with different amplitude
             v2 = 2048 + 500 * math.sin(2 * math.pi * self.freq2 * self.t)
             v2 += random.randint(-self.noise, self.noise)
+            # Add random spikes
+            if random.random() < 0.01:
+                v2 += random.choice([-1000, 1000])
             v2 = max(0, min(self.adc_max, int(v2)))
             self.buf_ch2.append(v2)
             
@@ -191,6 +197,14 @@ class SerialReader(threading.Thread):
 # ------------------------------------------------------------
 # Trigger utilities
 # ------------------------------------------------------------
+def moving_average(data, window_size=5):
+    """Simple moving average filter."""
+    if len(data) < window_size:
+        return data
+    ret = np.cumsum(data, dtype=float)
+    ret[window_size:] = ret[window_size:] - ret[:-window_size]
+    return list(ret[window_size - 1:] / window_size)
+
 def find_triggers(data, threshold, rising=True, max_found=3):
     """Return indices where threshold crossing happens."""
     out = []
@@ -609,19 +623,25 @@ class MainWindow(QMainWindow):
         raw_ch1 = list(self.buffer_ch1)
         raw_ch2 = list(self.buffer_ch2)
 
+        # Filter-Then-Trigger Strategy
+        # 1. Create shadow clean data
+        clean_ch1 = moving_average(raw_ch1, window_size=15)
+        clean_ch2 = moving_average(raw_ch2, window_size=15)
+
         # Calculate samples to display based on time/div
         # Assume 10 divisions horizontal (typical oscilloscope)
         samples_to_show = int(self.time_per_div * FAKE_FS * 10)
         samples_to_show = max(100, min(samples_to_show, len(raw_ch1)))  # clamp
 
         # Independent triggering for each channel
-        # Trigger on CH1 first
-        triggers_ch1 = find_triggers(raw_ch1, self.threshold_ch1, self.trigger_rising, max_found=1)
+        # Trigger on CH1 first (using CLEAN data)
+        triggers_ch1 = find_triggers(clean_ch1, self.threshold_ch1, self.trigger_rising, max_found=1)
         
         # Build CH1 data window according to trigger mode
         if self.trigger_mode == "AUTO":
             if len(triggers_ch1) >= 1:
                 p0_ch1 = triggers_ch1[0]
+                # Adjust for filter delay if needed, but for small window it's negligible or consistent
                 if p0_ch1 + samples_to_show <= len(raw_ch1):
                     data_ch1 = raw_ch1[p0_ch1:p0_ch1 + samples_to_show]
                 else:
@@ -641,8 +661,8 @@ class MainWindow(QMainWindow):
                 # In NORMAL mode, if no trigger, don't update
                 data_ch1 = []
 
-        # Now trigger on CH2 independently
-        triggers_ch2 = find_triggers(raw_ch2, self.threshold_ch2, self.trigger_rising, max_found=1)
+        # Now trigger on CH2 independently (using CLEAN data)
+        triggers_ch2 = find_triggers(clean_ch2, self.threshold_ch2, self.trigger_rising, max_found=1)
         
         # Build CH2 data window according to trigger mode
         if self.trigger_mode == "AUTO":
