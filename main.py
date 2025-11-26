@@ -23,7 +23,7 @@ import numpy as np
 # ------------------------------------------------------------
 # Config
 # ------------------------------------------------------------
-FAKE_FS = 6000  # Hz, fake sampling rate for the demo
+FAKE_FS = 2880  # Hz, fake sampling rate for the demo
 ADC_MAX = 4095
 VREF = 3.3
 NUM_CHANNELS = 2
@@ -269,6 +269,12 @@ class MainWindow(QMainWindow):
         self.ch1_offset = 0.0          # vertical offset in volts
         self.ch2_offset = 0.0
         
+        # Smart Auto-Scaling State
+        self.y_min = 0.0
+        self.y_max = 3.3
+        self.last_expansion_time = time.time()
+        self.auto_scale_timeout = 10.0  # seconds to wait before contracting
+
         # Channel enables
         self.ch1_enabled = True
         self.ch2_enabled = True
@@ -729,7 +735,44 @@ class MainWindow(QMainWindow):
             # TIME DOMAIN
             self.plot.setLabel("bottom", "Samples")
             self.plot.setLabel("left", "Volts")
-            self.plot.enableAutoRange()
+            
+            # --- Smart Auto-Scaling ---
+            # 1. Find min/max of current data
+            all_data = volts_ch1 + volts_ch2
+            if all_data:
+                curr_min = min(all_data)
+                curr_max = max(all_data)
+                
+                # Add some margin
+                margin = (curr_max - curr_min) * 0.1 if (curr_max - curr_min) > 0 else 0.1
+                target_min = curr_min - margin
+                target_max = curr_max + margin
+                
+                now = time.time()
+                
+                # Check for expansion
+                expanded = False
+                if target_min < self.y_min:
+                    self.y_min = target_min
+                    expanded = True
+                if target_max > self.y_max:
+                    self.y_max = target_max
+                    expanded = True
+                
+                if expanded:
+                    self.last_expansion_time = now
+                else:
+                    # Check for contraction (only if we haven't expanded recently)
+                    if (now - self.last_expansion_time) > self.auto_scale_timeout:
+                        # Contract slowly or jump? "Contract after delay" usually means we can now fit to the smaller signal
+                        # We'll just set it to the target
+                        self.y_min = target_min
+                        self.y_max = target_max
+                        self.last_expansion_time = now # Reset timer so we don't jitter if it's borderline
+
+            # Disable auto-range and set manual range
+            self.plot.disableAutoRange(axis=pg.ViewBox.YAxis)
+            self.plot.setYRange(self.y_min, self.y_max, padding=0)
             
             # Update both channel curves
             if self.ch1_enabled:
