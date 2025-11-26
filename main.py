@@ -205,16 +205,36 @@ def moving_average(data, window_size=5):
     ret[window_size:] = ret[window_size:] - ret[:-window_size]
     return list(ret[window_size - 1:] / window_size)
 
-def find_triggers(data, threshold, rising=True, max_found=3):
-    """Return indices where threshold crossing happens."""
+def find_triggers(data, threshold, rising=True, max_found=3, min_width=3):
+    """
+    Return indices where threshold crossing happens.
+    min_width: Number of consecutive samples that must be valid after crossing.
+    """
     out = []
-    for i in range(len(data) - 1):
+    N = len(data)
+    for i in range(N - min_width):
         if rising:
+            # Crossing: prev < th <= curr
             if data[i] < threshold <= data[i + 1]:
-                out.append(i)
+                # Check if it stays above threshold for min_width samples
+                valid = True
+                for k in range(1, min_width + 1):
+                    if i + k >= N or data[i + k] < threshold:
+                        valid = False
+                        break
+                if valid:
+                    out.append(i)
         else:
+            # Crossing: prev > th >= curr
             if data[i] > threshold >= data[i + 1]:
-                out.append(i)
+                # Check if it stays below threshold for min_width samples
+                valid = True
+                for k in range(1, min_width + 1):
+                    if i + k >= N or data[i + k] > threshold:
+                        valid = False
+                        break
+                if valid:
+                    out.append(i)
         if len(out) >= max_found:
             break
     return out
@@ -623,25 +643,22 @@ class MainWindow(QMainWindow):
         raw_ch1 = list(self.buffer_ch1)
         raw_ch2 = list(self.buffer_ch2)
 
-        # Filter-Then-Trigger Strategy
-        # 1. Create shadow clean data
-        clean_ch1 = moving_average(raw_ch1, window_size=15)
-        clean_ch2 = moving_average(raw_ch2, window_size=15)
-
+        # Time-Qualified Triggering Strategy (Glitch Rejection)
+        # We use raw data directly but require the signal to hold for min_width samples.
+        
         # Calculate samples to display based on time/div
         # Assume 10 divisions horizontal (typical oscilloscope)
         samples_to_show = int(self.time_per_div * FAKE_FS * 10)
         samples_to_show = max(100, min(samples_to_show, len(raw_ch1)))  # clamp
 
         # Independent triggering for each channel
-        # Trigger on CH1 first (using CLEAN data)
-        triggers_ch1 = find_triggers(clean_ch1, self.threshold_ch1, self.trigger_rising, max_found=1)
+        # Trigger on CH1 first (using RAW data with glitch rejection)
+        triggers_ch1 = find_triggers(raw_ch1, self.threshold_ch1, self.trigger_rising, max_found=1, min_width=3)
         
         # Build CH1 data window according to trigger mode
         if self.trigger_mode == "AUTO":
             if len(triggers_ch1) >= 1:
                 p0_ch1 = triggers_ch1[0]
-                # Adjust for filter delay if needed, but for small window it's negligible or consistent
                 if p0_ch1 + samples_to_show <= len(raw_ch1):
                     data_ch1 = raw_ch1[p0_ch1:p0_ch1 + samples_to_show]
                 else:
@@ -661,8 +678,8 @@ class MainWindow(QMainWindow):
                 # In NORMAL mode, if no trigger, don't update
                 data_ch1 = []
 
-        # Now trigger on CH2 independently (using CLEAN data)
-        triggers_ch2 = find_triggers(clean_ch2, self.threshold_ch2, self.trigger_rising, max_found=1)
+        # Now trigger on CH2 independently (using RAW data with glitch rejection)
+        triggers_ch2 = find_triggers(raw_ch2, self.threshold_ch2, self.trigger_rising, max_found=1, min_width=3)
         
         # Build CH2 data window according to trigger mode
         if self.trigger_mode == "AUTO":
